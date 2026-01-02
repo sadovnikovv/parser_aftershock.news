@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# SQLite + WAL/SHM
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Exports
+compact_out/
+*.xlsx
+*.csv
+
+# ML artifacts (если не хотите хранить модель в репозитории)
+*.joblib

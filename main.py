@@ -22,8 +22,8 @@ from tqdm import tqdm
 # НАСТРОЙКИ (шапка)
 # ============================================================
 # Диапазон. Если пусто => парсить 1..latest
-start_search = ""   # например "1573896"
-stop_search = ""    # например "1573996" (включительно)
+start_search = "999967"   # например "1573896"
+stop_search = "1574096"    # например "1573996" (включительно)
 
 # Параллельность/тайминги
 CONCURRENCY = 6
@@ -53,8 +53,13 @@ HEUR_TRAIN_THRESHOLD = 2
 MAX_DB_BYTES = 35 * 1024 * 1024
 
 # Логи
-LOG_LEVEL = "INFO"   # DEBUG/INFO/WARNING/ERROR
+CONSOLE_LOG_LEVEL = "INFO"     # в консоль: кратко
+FILE_LOG_LEVEL = "DEBUG"       # в файл: подробно
 LOG_FILE = "aftershock_parser.log"
+DEBUG_LOG_FILE = "aftershock_debug.log"
+
+# Как часто печатать OK (успешные) в INFO (чтобы не спамить)
+OK_LOG_EVERY = 50
 
 # Юзер-агент
 USER_AGENT = "Mozilla/5.0 (compatible; research-bot; +https://example.com)"
@@ -107,16 +112,58 @@ class Article:
 
 
 # ----------------------------
-# Utils
+# Logging
 # ----------------------------
 def setup_logging():
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL),
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)  # общий уровень на максимум, фильтруем хендлерами
+
+    # очистка хендлеров (если PyCharm/среда повторно инициализирует)
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    ch = logging.StreamHandler()
+    ch.setLevel(getattr(logging, CONSOLE_LOG_LEVEL))
+    ch.setFormatter(fmt)
+
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(getattr(logging, CONSOLE_LOG_LEVEL))
+    fh.setFormatter(fmt)
+
+    dfh = logging.FileHandler(DEBUG_LOG_FILE, encoding="utf-8")
+    dfh.setLevel(getattr(logging, FILE_LOG_LEVEL))
+    dfh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    logger.addHandler(dfh)
+
+
+def log_skip(nid: int, url: str, status: int | None, reason: str, details: dict):
+    # кратко в INFO
+    logging.info(f"SKIP nid={nid} status={status} reason={reason}")
+    # подробно в DEBUG отдельной строкой JSON
+    safe = json.dumps(details, ensure_ascii=False, default=str)
+    logging.debug(f"SKIP_DETAIL nid={nid} reason={reason} details={safe}")
+
+
+def log_ok_sparse(nid: int, state: dict, direction: str, conf: float | None, title: str | None, text_len: int):
+    if state["saved"] % OK_LOG_EVERY != 0:
+        return
+    t = (title or "").strip()
+    if len(t) > 90:
+        t = t[:90] + "..."
+    logging.info(
+        f"OK nid={nid} saved={state['saved']} processed={state['processed']} skipped={state['skipped']} "
+        f"dir={direction} conf={conf} text_len={text_len} title={t!r}"
     )
 
 
+# ----------------------------
+# Utils
+# ----------------------------
 def clean_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
@@ -217,6 +264,7 @@ def is_soft_404(html_txt: str) -> bool:
     if "запрашиваемая страница" in low and "не найдена" in low:
         return True
 
+    # точнее: <div class="aft-postcontent"><h1>Страница не найдена</h1>
     try:
         tree = html.fromstring(html_txt)
         h1 = tree.xpath("//div[contains(@class,'aft-postcontent')]//h1/text()")
@@ -295,7 +343,6 @@ async def ensure_schema(db: aiosqlite.Connection):
     )
     await db.commit()
 
-    # migrations for older db files
     await _add_column_if_missing(db, "articles", "direction_confidence", "REAL")
 
 
@@ -339,7 +386,8 @@ async def get_latest_nid(session: aiohttp.ClientSession) -> int | None:
             if r.status != 200:
                 return None
             html_txt = await r.text(errors="ignore")
-    except Exception:
+    except Exception as e:
+        logging.debug(f"get_latest_nid error={type(e).__name__}")
         return None
 
     m = re.findall(r"\?q=node/(\d+)", html_txt)
@@ -350,68 +398,121 @@ async def get_latest_nid(session: aiohttp.ClientSession) -> int | None:
 
 async def fetch_html(session: aiohttp.ClientSession, nid: int, max_retries: int = 5):
     """
-    Returns: (status, html_text_or_None, reason)
+    Returns: (status, html_text_or_None, reason, meta_dict)
     """
     url = NODE_URL.format(nid=nid)
+    last_status = None
+    last_len = None
 
     for attempt in range(max_retries):
         try:
             async with session.get(url, timeout=REQUEST_TIMEOUT_SEC) as r:
                 status = r.status
+                last_status = status
+
                 txt = await r.text(errors="ignore")
+                last_len = len(txt)
+
+                meta = {
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "url": url,
+                    "content_len": last_len,
+                    "server": r.headers.get("Server"),
+                    "content_type": r.headers.get("Content-Type"),
+                }
 
                 if status == 404:
-                    return status, None, "404"
+                    return status, None, "404", meta
 
                 if status in (429, 403, 503):
                     ra = r.headers.get("Retry-After")
                     wait = int(ra) if (ra and ra.isdigit()) else (2 ** attempt)
+                    meta["retry_after"] = ra
+                    meta["wait"] = wait
                     logging.warning(f"RETRY nid={nid} status={status} wait={wait}s attempt={attempt+1}/{max_retries}")
                     await asyncio.sleep(wait)
                     continue
 
                 if status != 200:
-                    return status, None, f"http_{status}"
+                    return status, None, f"http_{status}", meta
 
                 low = txt.lower()
                 if any(m in low for m in CAPTCHA_MARKERS):
-                    return status, None, "captcha_detected"
+                    meta["captcha_marker_hit"] = True
+                    return status, None, "captcha_detected", meta
 
                 if is_soft_404(txt):
-                    return status, None, "soft_404_page"
+                    meta["soft_404_hit"] = True
+                    return status, None, "soft_404_page", meta
 
                 await asyncio.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
-                return status, txt, "ok"
+                return status, txt, "ok", meta
 
         except asyncio.TimeoutError:
             wait = 2 ** attempt
+            meta = {"attempt": attempt + 1, "max_retries": max_retries, "url": url, "wait": wait}
             logging.warning(f"RETRY nid={nid} reason=timeout wait={wait}s attempt={attempt+1}/{max_retries}")
             await asyncio.sleep(wait)
+            last_status = last_status
             continue
         except aiohttp.ClientError as e:
             wait = 2 ** attempt
+            meta = {"attempt": attempt + 1, "max_retries": max_retries, "url": url, "wait": wait, "client_error": type(e).__name__}
             logging.warning(f"RETRY nid={nid} reason=client_error={type(e).__name__} wait={wait}s attempt={attempt+1}/{max_retries}")
             await asyncio.sleep(wait)
             continue
         except Exception as e:
             wait = 2 ** attempt
+            meta = {"attempt": attempt + 1, "max_retries": max_retries, "url": url, "wait": wait, "error": type(e).__name__}
             logging.warning(f"RETRY nid={nid} reason=error={type(e).__name__} wait={wait}s attempt={attempt+1}/{max_retries}")
             await asyncio.sleep(wait)
             continue
 
-    return None, None, "max_retries_exceeded"
+    meta = {"attempts": max_retries, "url": url, "last_status": last_status, "last_content_len": last_len}
+    return last_status, None, "max_retries_exceeded", meta
 
 
-def parse_article(nid: int, url: str, html_txt: str):
+def parse_article(html_txt: str):
     tree = html.fromstring(html_txt)
     title = extract_title(tree)
     published_at, published_raw = extract_best_date(tree)
     text = extract_body_text(tree)
-    return title, published_at, published_raw, text
+    return tree, title, published_at, published_raw, text
+
+
+def diagnose_parsed_bad(tree: html.HtmlElement, title: str | None, text: str):
+    # собираем “почему не похоже на статью”
+    body_nodes = tree.xpath("//div[contains(@class,'field-name-body')]")
+    article_nodes = tree.xpath("//article")
+    node_div = tree.xpath("//div[starts-with(@id,'node-')]")
+
+    meta_pub = tree.xpath("//meta[@property='article:published_time']/@content")
+    has_meta_pub = bool(meta_pub)
+
+    # кусок “главного контента” для дебага (без простыней)
+    main_txt = ""
+    try:
+        main = tree.xpath("//div[contains(@class,'region-content')]")
+        if main:
+            main_txt = clean_text(main[0].text_content())[:250]
+    except Exception:
+        main_txt = ""
+
+    return {
+        "title_found": bool(title),
+        "title": (title[:140] if title else None),
+        "body_nodes": len(body_nodes),
+        "article_nodes": len(article_nodes),
+        "node_divs": len(node_div),
+        "text_len": len(text),
+        "has_meta_published_time": has_meta_pub,
+        "main_content_snippet": main_txt,
+    }
 
 
 # ----------------------------
-# Worker pipeline (queue-based, scalable)
+# Worker pipeline (queue-based)
 # ----------------------------
 async def persist_article(state: dict, article: Article):
     async with state["db_lock"]:
@@ -441,14 +542,15 @@ async def worker(name: str, q: asyncio.Queue, session: aiohttp.ClientSession, st
             q.task_done()
             return
 
+        url = NODE_URL.format(nid=nid)
         try:
-            url = NODE_URL.format(nid=nid)
-            status, html_txt, reason = await fetch_html(session, nid)
+            status, html_txt, reason, meta = await fetch_html(session, nid)
             state["processed"] += 1
 
             if reason == "captcha_detected":
                 state["captcha"] += 1
-                logging.error(f"CAPTCHA nid={nid} url={url}")
+                details = {"nid": nid, "url": url, "status": status, **meta}
+                log_skip(nid, url, status, reason, details)
                 if CAPTCHA_POLICY == "stop":
                     raise RuntimeError("CAPTCHA detected. Stopping by policy.")
                 state["skipped"] += 1
@@ -457,24 +559,29 @@ async def worker(name: str, q: asyncio.Queue, session: aiohttp.ClientSession, st
             if not html_txt:
                 state["skipped"] += 1
                 state["skip_reasons"][reason] = state["skip_reasons"].get(reason, 0) + 1
-                logging.info(f"SKIP nid={nid} status={status} reason={reason}")
+                details = {"nid": nid, "url": url, "status": status, **meta}
+                log_skip(nid, url, status, reason, details)
                 continue
 
             try:
-                title, published_at, published_raw, text = parse_article(nid, url, html_txt)
+                tree, title, published_at, published_raw, text = parse_article(html_txt)
             except Exception as e:
                 state["skipped"] += 1
                 state["skip_reasons"]["parse_error"] = state["skip_reasons"].get("parse_error", 0) + 1
-                logging.info(f"SKIP nid={nid} reason=parse_error err={type(e).__name__}")
+                details = {"nid": nid, "url": url, "status": status, **meta, "error": type(e).__name__}
+                log_skip(nid, url, status, "parse_error", details)
                 continue
 
             text = clean_text(text)
-            if not title or len(text) < MIN_TEXT_LEN:
+            if (not title) or (len(text) < MIN_TEXT_LEN):
                 state["skipped"] += 1
                 state["skip_reasons"]["parsed_bad"] = state["skip_reasons"].get("parsed_bad", 0) + 1
-                logging.info(f"SKIP nid={nid} reason=parsed_bad title={bool(title)} text_len={len(text)}")
+                diag = diagnose_parsed_bad(tree, title, text)
+                details = {"nid": nid, "url": url, "status": status, **meta, **diag}
+                log_skip(nid, url, status, "parsed_bad", details)
                 continue
 
+            # --- Классификация / теги ---
             tags = keyword_tags_ru(text, top_k=TAGS_TOPK)
             heur_label, heur_score = heuristic_direction(text)
 
@@ -516,11 +623,8 @@ async def worker(name: str, q: asyncio.Queue, session: aiohttp.ClientSession, st
 
             await persist_article(state, article)
 
-            if state["saved"] % 25 == 0:
-                logging.info(
-                    f"OK nid={nid} saved={state['saved']} processed={state['processed']} skipped={state['skipped']} "
-                    f"dir={direction} conf={conf}"
-                )
+            # Успешные — редко и кратко
+            log_ok_sparse(nid, state, direction, conf, title, len(text))
 
         finally:
             q.task_done()
@@ -568,6 +672,7 @@ async def main():
         if not latest:
             raise RuntimeError("Не удалось определить latest_nid через /?q=all")
 
+        # Диапазон из шапки
         if start_search.strip() and stop_search.strip():
             start = int(start_search)
             end = int(stop_search)
@@ -589,9 +694,9 @@ async def main():
         logging.info(
             f"Concurrency={CONCURRENCY} timeout={REQUEST_TIMEOUT_SEC}s sleep={SLEEP_BETWEEN_REQUESTS_SEC}s captcha_policy={CAPTCHA_POLICY}"
         )
+        logging.info(f"Detailed debug -> {DEBUG_LOG_FILE}")
 
         pbar = tqdm(total=total, desc="Processed", unit="node")
-
         workers = [
             asyncio.create_task(worker(f"w{i+1}", q, session, state, pbar, pbar_lock))
             for i in range(CONCURRENCY)
@@ -606,15 +711,10 @@ async def main():
 
             await q.join()
 
-        except RuntimeError as e:
-            logging.error(str(e))
-            raise
-
         finally:
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
-
             async with pbar_lock:
                 pbar.close()
 
